@@ -1,0 +1,8 @@
+# nothing secret belongs in this repo; these are only here so a mistake cannot be committed
+.env
+*.key
+*.pem
+*secret*
+alerts-compact.json
+alerts-full.json
+work/alerts-cache/
