@@ -43,6 +43,33 @@ check('file has the world schema, 60 hours, all 8 fields, 2,520 series each', w[
 check('not synthetic and no missing points', w['synthetic'] is False and w['missingPoints'] == [])
 check('point order is row (latitude) major', w['fields']['t'][0][0] == point(-85, -180)['fields']['t'][0] and w['fields']['t'][72][0] == point(-80, -180)['fields']['t'][0])
 
+# a point that fails every first try but answers on the second pass is not left missing
+failed_once = {}
+def flaky(lat, lon, hours):
+    key = (lat, lon)
+    if key in [(0, 0), (10, 10)]:
+        failed_once[key] = failed_once.get(key, 0) + 1
+        if failed_once[key] <= 3:             # the three tries of the main pass all fail
+            raise urllib.error.URLError('busy')
+    return point(lat, lon)
+w = run(flaky)
+check('a point that fails the main pass is asked again on the second pass and filled', w['missingPoints'] == [] and w['calls'] == 2520)
+check('the second pass asks only the failed points (3 failures + 1 success each)', failed_once == {(0, 0): 4, (10, 10): 4})
+
+# a point that keeps failing after the second pass stays missing, and the refused ones are never retried
+asked = []
+def stubborn(lat, lon, hours):
+    asked.append((lat, lon))
+    if (lat, lon) == (5, 5):
+        raise urllib.error.URLError('down')
+    if (lat, lon) == (10, 10):
+        raise urllib.error.HTTPError('u', 422, 'x', {}, None)
+    return point(lat, lon)
+w = run(stubborn)
+check('a stubborn point stays missing after the passes', (5 + 85) // 5 * 72 + (5 + 180) // 5 in w['missingPoints'])
+check('a refused (422) point is asked once only', asked.count((10, 10)) == 1)
+check('a stubborn point is tried 3 times in the main pass and 3 in each of 2 second passes', asked.count((5, 5)) == 9)
+
 # a point that never answers stays unavailable, within the 2% allowance
 def one_dead(lat, lon, hours):
     if (lat, lon) == (0, 0):

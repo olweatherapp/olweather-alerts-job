@@ -69,27 +69,33 @@ class Limiter:
             time.sleep(at - now)
 
 
-def build(hours, fetch=default_fetch, rate=4.0, workers=4, progress=None, retries=3, sleep=time.sleep, now=time.time):
+def build(hours, fetch=default_fetch, rate=4.0, workers=4, progress=None, retries=3, sleep=time.sleep, now=time.time, second_passes=2, second_pass_pause=20):
     """Returns the world file as a dict, or raises SystemExit with a reason when too few points came back."""
     limiter = Limiter(rate)
     results, lock, done = {}, threading.Lock(), [0]
     total = len(LATS) * len(LONS)
 
-    def job(i, j):
-        body = None
+    refused = set()    # points the route will never serve (400/422): never retried
+
+    def ask(i, j):
+        """Up to `retries` tries for one point; returns the body or None."""
         for attempt in range(retries):
             limiter.wait()
             try:
                 got = fetch(LATS[i], LONS[j], hours)
                 if valid_point(got, hours):
-                    body = got
-                    break
+                    return got
             except urllib.error.HTTPError as e:
-                if e.code in (400, 422):          # a point the route will never serve
-                    break
+                if e.code in (400, 422):
+                    refused.add((i, j))
+                    return None
                 sleep(2 * (attempt + 1))
             except Exception:
                 sleep(2 * (attempt + 1))
+        return None
+
+    def job(i, j):
+        body = ask(i, j)
         with lock:
             results[(i, j)] = body
             done[0] += 1
@@ -99,6 +105,18 @@ def build(hours, fetch=default_fetch, rate=4.0, workers=4, progress=None, retrie
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         for f in [pool.submit(job, i, j) for i in range(len(LATS)) for j in range(len(LONS))]:
             f.result()
+
+    # Second pass: one-off failures (a timeout, a busy moment) are asked again after a pause, so a run rarely ends with gaps.
+    # Points the route refused are not asked again, and a point that still fails stays unavailable (never filled from a neighbour).
+    for round_ in range(second_passes):
+        again = [k for k, v in results.items() if v is None and k not in refused]
+        if not again:
+            break
+        sleep(second_pass_pause)
+        if progress:
+            progress(total, total)
+        for k in sorted(again):
+            results[k] = ask(*k)
 
     good = [b for b in results.values() if b is not None]
     if len(good) < MIN_GOOD_SHARE * total:
