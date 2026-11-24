@@ -1,0 +1,52 @@
+# Refreshes the saved world forecast file twice a day (every 12 hours) and writes it to Cloudflare KV key `world-grid`.
+# One request per lattice point (2,520), each one WeatherAPI call made by the OLWeather Worker (which holds the key; no key here).
+# Same safety rules as the alerts job: no pull_request trigger, no token rights for GITHUB_TOKEN, pinned actions, nothing from npm,
+# secrets only in the last step. A run that gets too few points writes nothing, so the previous file stays.
+name: world-grid
+on:
+  schedule:
+    - cron: '17 5,17 * * *'
+  workflow_dispatch: {}
+permissions: {}
+concurrency:
+  group: world-grid
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Build the world file (2,520 points, about 11 minutes)
+        env:
+          WORLD_SAMPLER_USER_AGENT: OLWeather-world-sampler/1.0 (+https://olweather.com/contact)
+        run: python world-sampler-point.py --run --hours 60 --out world-grid.json
+      - name: Check the file before it is used
+        run: |
+          python - <<'PY'
+          import json, sys
+          d = json.load(open('world-grid.json', encoding='utf-8'))
+          ok = (d.get('schema') == 'olweather.earthlens.world-grid.v1' and d.get('synthetic') is False and d.get('rows') == 35 and d.get('cols') == 72
+                and d.get('hours', 0) >= 24 and len(d.get('missingPoints', [])) <= 50 and set(d.get('fields', {})) >= {'t','h','uv','p','ws','wd','c','r'})
+          size = len(open('world-grid.json','rb').read())
+          print('hours', d.get('hours'), 'missing', len(d.get('missingPoints', [])), 'bytes', size)
+          sys.exit(0 if ok and 1_000_000 < size < 20_000_000 else 'file failed the checks: not uploading')
+          PY
+      - name: Write to Cloudflare KV
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_KV: ${{ secrets.EARTHLENS_KV_NAMESPACE_ID }}
+        run: |
+          set +x
+          curl -sS --fail-with-body --proto '=https' --tlsv1.2 -X PUT \
+            -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
+            --data-binary "@world-grid.json" \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/storage/kv/namespaces/${CF_KV}/values/world-grid" > /dev/null
